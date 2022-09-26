@@ -1,20 +1,19 @@
 #include <Arduino.h>
-#include "FS.h"
+//#include "FS.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
 #include <DHTesp.h>
 #include <NTPClient.h>
-#include <WiFiUdp.h>
+//#include <WiFiUdp.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
-#include <WebServer.h>
-#include <DNSServer.h>
+//#include <WebServer.h>
+//#include <DNSServer.h>
 #include <time.h>
 #include <EEPROM.h> 
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BMP280.h>
-#include <WiFiManager.h>
 #include "ThingSpeak.h"
 
 
@@ -33,18 +32,27 @@ boolean prueba=1; //En 1 para usar con prototipo de casa, 0 para compilar y carg
 #define LUZ_IN GPIO_NUM_27
 #define DHT_INT_PIN GPIO_NUM_15
 #define DHT_EXT_PIN GPIO_NUM_16
-WiFiManager wifiManager;
 
 
-#define version 100 //version de soft 
+#define version 102 //version de soft 
 
+#define LENGTH(x) (strlen(x) + 1)   // length of char string
+#define EEPROM_SIZE 80             // EEPROM size
+#define WiFi_rst 0                  //WiFi credential reset pin (Boot button on ESP32)
+String ssid;                        //string variable to store ssid
+String pss;                         //string variable to store password
+unsigned long rst_millis;
+unsigned long led_timer;
+boolean ledstate;
+boolean led_enable;
+boolean reset_ssd_state;
 
 byte indice=0;
 byte clienteactual; //LLeva registro del numero de cliente de telegram que envio el ultimo mensaje al bot
 unsigned long timeuniversal;
 const long utcOffsetInSeconds = -10800; // GMT -3 (-3x60x60) 
 //char daysOfTheWeek[7][12] = {"Domingo", "Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado"};
-unsigned long BOT_MTBS = 1000; // mean time between scan messages
+unsigned long BOT_MTBS = 1500; // mean time between scan messages
 String cadena;
 String text;
 WiFiUDP ntpUDP;
@@ -160,7 +168,6 @@ void enviarnotificaciones() {
   while (alarmasporenviar) {
       if (registroIDs[alarmasporenviar-1].IDTelegram!=NULL) { //Empezando por la ultima posicion de Id se fija si no esta vacia y emvia el mensaje de alarma
         bot.sendMessage(registroIDs[alarmasporenviar-1].IDTelegram, cadena, ""); 
-        yield();
       }
     alarmasporenviar--;            
   }
@@ -417,6 +424,67 @@ String temp="";
   }
 }
 
+void writeStringToFlash(const char* toStore, int startAddr) {
+int i;
+  for (i=0; i < LENGTH(toStore); i++) {
+    EEPROM.write(startAddr + i, toStore[i]);
+  }
+  EEPROM.write(startAddr + i, '\0');
+  EEPROM.commit();
+}
+
+void IniciaSmartconfig() {  
+    //Init WiFi as Station, start SmartConfig
+    Serial.println("iniciando SmartConfig.");
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.beginSmartConfig();
+
+    //Wait for SmartConfig packet from mobile
+    Serial.println("Waiting for SmartConfig.");
+      while (!WiFi.smartConfigDone()) {
+        delay(500);
+        Serial.print(".");
+      }
+
+    Serial.println("");
+    Serial.println("SmartConfig received.");
+
+    //Wait for WiFi to connect to AP
+    Serial.println("Waiting for WiFi");
+      while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+      }
+
+    Serial.println("WiFi Connected.");
+
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    // read the connected WiFi SSID and password
+    ssid = WiFi.SSID();
+    pss = WiFi.psk();
+    Serial.print("SSID:");
+    Serial.println(ssid);
+    Serial.print("PSS:");
+    Serial.println(pss);
+    Serial.println("Store SSID & PSS in Flash");
+    writeStringToFlash(ssid.c_str(), 0); // storing ssid at address 0
+    writeStringToFlash(pss.c_str(), 20); // storing pss at address 20
+  
+}
+
+String readStringFromFlash(int startAddr) {
+  char in[20]; // char array of size 20 for reading the stored data 
+  //char curIn = EEPROM.read(startAddr);
+  int i=0;
+    do {
+      in[i] = EEPROM.read(startAddr + i);
+      i++;
+    } while(in[i-1]!='\0');
+  return String(in);
+}
+
 
 void showregistroid() {
   String temp="Contenido inicial EEPROM ";
@@ -485,23 +553,7 @@ void enviardataTS(float data, byte field) {
  client.stop();
 }
 
-/*Verifica el estado de la conexion, si no esta conectado intenta conectarse
-primero con los parametros almacenados y si no puede crea el softAP para configurarlo con el celu.
-Si no se entra a configurarlo dentro del timeout (120) la funcion retorna sin hacer nada*/
-void GetandCheckConnection() {
-  if (WiFi.status() != WL_CONNECTED) {
-    wifiManager.setConfigPortalTimeout(60); 
-     wifiManager.autoConnect("Green");
-     yield();
-  }
-    if (WiFi.status() != WL_CONNECTED) {
-      EEPROM.put(64, number_of_resets);  
-      resetcode=1;  //code=1 indica que se reinicio a proposito.    
-      EEPROM.put(68, resetcode); 
-      EEPROM.commit();
-      ESP.restart(); 
-    }
-}
+
 //Recibe texto enviado al bot y envia mensaje con la respuesta correspondiente
 String procesarmsgparam(String texto) {
   String mensajes[]={
@@ -1321,15 +1373,58 @@ bme.begin(0x76);
 
 
   pinMode(LED_BUILTIN, OUTPUT);
+  EEPROM.begin(EEPROM_SIZE);
   if (!prueba) pinMode(LUZ_IN, INPUT); //para que si esta en prueba no habilite el pin D7 (Entrada digital del sensor de luz), que va conectado al led para simular la valvula de riego 
   pinMode(valvulariego, OUTPUT);
-  GetandCheckConnection();  
-    if (WiFi.status() == WL_CONNECTED) {   
-      Serial.println("Conectado a: " + WiFi.SSID());
-     secured_client.setCACert(TELEGRAM_CERTIFICATE_ROOT); // Add root certificate for api.telegram.org
-      Serial.println("Retrieving time: ");
-      configTime(0, 0, "pool.ntp.org"); // Probando ahora con servidor de Argentina!!
-      time_t now = time(nullptr);
+  pinMode(WiFi_rst, INPUT); 
+     delay(3000);
+   while (digitalRead(WiFi_rst) == LOW) { //Si se mantiene apretado el boton en el inicia durante 3 segundos resetea las credenciales
+    if (millis() >= 6000)
+      {
+        Serial.println("Reseting the WiFi credentials");
+        writeStringToFlash("", 0); // Reset the SSID
+        writeStringToFlash("", 20); // Reset the Password
+        Serial.println("Wifi credentials erased");
+        Serial.println("Restarting the ESP");
+        delay(1000);
+        ESP.restart();            // Restart ESP
+      } 
+ }
+
+    ssid = readStringFromFlash(0); // Read SSID stored at address 100
+    Serial.print("SSID = ");
+    Serial.println(ssid);
+    Serial.print("largo=");
+    Serial.println(ssid.length());
+    pss = readStringFromFlash(20); // Read Password stored at address 140
+    Serial.print("psss = ");
+    Serial.println(pss);
+    Serial.print("largo=");
+    Serial.println(pss.length());
+  
+
+  if(ssid[0]!='\0') {
+      WiFi.begin(ssid.c_str(), pss.c_str());
+      Serial.println("Waiting for WiFi");
+        while (WiFi.status() != WL_CONNECTED) {
+          delay(500);
+          Serial.print(".");
+        } 
+    }
+
+    if (WiFi.status() != WL_CONNECTED) // if WiFi is not connected
+    {
+      IniciaSmartconfig();
+    }
+      else
+      {
+        Serial.println("WiFi Connected");
+        Serial.print("IP Address: ");
+        Serial.println(WiFi.localIP());
+        secured_client.setCACert(TELEGRAM_CERTIFICATE_ROOT); // Add root certificate for api.telegram.org
+        Serial.println("Retrieving time: ");
+        configTime(0, 0, "pool.ntp.org"); // Probando ahora con servidor de Argentina!!
+        time_t now = time(nullptr);
         while (now < 24 * 3600) {       
           Serial.print(".");
           delay(100);
@@ -1337,8 +1432,9 @@ bme.begin(0x76);
         } 
       Serial.println(now); 
       timermaxmin=millis();
-    }
-  EEPROM.begin(128); // Set aside some memory
+      }
+
+
   leerdataEEPROM();
   showregistroid();
   //carga desde la EEPROMtodos los parametros
@@ -1387,7 +1483,6 @@ bme.begin(0x76);
   relevardatos();
   inizializamaxmin(); //releva datos y pone los arrays de max y minimo a los mismos valores  
 }
-
  
 
 void loop() {
@@ -1433,7 +1528,6 @@ void loop() {
           ultimochequeoalarma=millis();
           relevardatos(); //Actualiza los estados de alarmas para no quedar colgado con info vieja
           cadena=generartextoalarma(estadoalarma);
-          yield();
             if (estadoalarma && flagalarma) alarmasporenviar=numclientes;
               else alarmasporenviar=0;        
             if (WiFi.status() != WL_CONNECTED) { 
@@ -1496,11 +1590,9 @@ void loop() {
     if (!thingspeakwaitflag) {
       if (((millis()-timermaxmin)/60000)>periodomaxmin) {
         timermaxmin=millis(); // Si el timer de max y min llego al tiempo especificado (por ejemplo 12 horas) se resetea.
-        yield();
         inizializamaxmin();
       }
       relevardatos();
-      GetandCheckConnection(); //Checa la conexion cada vez que se tome una nueva muetra
         if (WiFi.status()!=WL_CONNECTED) {
         EEPROM.put(64, number_of_resets);  
         resetcode=1;  //code=1 indica que se reinicio a proposito.    
@@ -1508,7 +1600,6 @@ void loop() {
         EEPROM.commit();
         ESP.restart();
         }
-      yield();
       enviardataTS(datos[indice],1); //Envia primer dato del array
       Serial.println("Data 0 sent to Thingspeak");
       thingspeakwaitflag=1;
@@ -1517,8 +1608,6 @@ void loop() {
 
     } else if ((millis()-thingspeakwaitTimer)>delaythingspeak) {                  
               if (indice<numparametros) {
-                  GetandCheckConnection();
-                  yield();
                   enviardataTS(datos[indice],indice+1);
                   Serial.print("Data ");
                   Serial.print(indice);
